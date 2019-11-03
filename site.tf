@@ -1,37 +1,24 @@
 variable "site_domain" {
     default = "testsiteserver.com"
 }
-variable "mime_types" {
-  default = {
-    htm = "text/html"
-    html = "text/html"
-    css = "text/css"
-    js = "application/javascript"
-    map = "application/javascript"
-    json = "application/json"
-  }
-}
 
 provider "aws" {
     region = "eu-west-2"
 }
 
-terraform { 
-    required_providers { 
-        aws = ">=2.26.0" 
-    } 
-    required_version = ">=0.12.8" 
-}
-
+# Encryption key for bucket contents
 resource "aws_kms_key" "bucket_encrypt" {
   description             = "Bucket Encryption Key"
   deletion_window_in_days = 10
 }
 
+# Create logs bucket
 resource "aws_s3_bucket" "logs" {
     bucket = "${var.site_domain}-logs"
     acl = "log-delivery-write"
 }
+
+# Create main site bucket
 resource "aws_s3_bucket" "site" {
     bucket = "${var.site_domain}"
     acl = "public-read"
@@ -69,6 +56,7 @@ POLICY
     }
 }
 
+# Secondary 'provider' needed as ACM certificates for cloudfront can only be used from us-east-1
 provider "aws" {
     alias = "acm-region"
     region = "us-east-1"
@@ -79,6 +67,7 @@ data "aws_route53_zone" "zone" {
     private_zone = false
 }
 
+# Request the certificate
 resource "aws_acm_certificate" "cert" {
   provider = "aws.acm-region"
   domain_name = "${var.site_domain}"
@@ -86,6 +75,7 @@ resource "aws_acm_certificate" "cert" {
   validation_method = "DNS"
 }
 
+# Create the two records for certificate validation
 resource "aws_route53_record" "cert_validation" {
   name = "${aws_acm_certificate.cert.domain_validation_options.0.resource_record_name}"
   type = "${aws_acm_certificate.cert.domain_validation_options.0.resource_record_type}"
@@ -102,12 +92,14 @@ resource "aws_route53_record" "cert_validation_alt" {
   ttl = 60
 }
 
+# Validation
 resource "aws_acm_certificate_validation" "cert" {
   provider = "aws.acm-region"
   certificate_arn = "${aws_acm_certificate.cert.arn}"
   validation_record_fqdns = ["${aws_route53_record.cert_validation.fqdn}", "${aws_route53_record.cert_validation_alt.fqdn}"]
 }
 
+# Now certificate is in place we can create cloudfront
 resource "aws_cloudfront_distribution" "cloudfront" {
     origin {
         domain_name = "${aws_s3_bucket.site.bucket_regional_domain_name}"
@@ -125,8 +117,10 @@ resource "aws_cloudfront_distribution" "cloudfront" {
         cached_methods = ["GET", "HEAD", "OPTIONS"]
         target_origin_id = "${var.site_domain}-origin"
 
+        # force use of https
         viewer_protocol_policy = "redirect-to-https"
         min_ttl = 0
+        # low default_ttl so we can update and see relatively quickly without having to invalidate cache
         default_ttl = 300
         max_ttl = 86400
 
@@ -145,6 +139,7 @@ resource "aws_cloudfront_distribution" "cloudfront" {
         }
     }
 
+    # Use our previosly created cert
     viewer_certificate {
         acm_certificate_arn = "${aws_acm_certificate_validation.cert.certificate_arn}"
         ssl_support_method = "sni-only"
@@ -152,6 +147,7 @@ resource "aws_cloudfront_distribution" "cloudfront" {
     }
 }
 
+# Create A records for both site_domain and www.site_domain
 resource "aws_route53_record" "a-record" {
     zone_id = "${data.aws_route53_zone.zone.zone_id}"
     name = "${var.site_domain}"
